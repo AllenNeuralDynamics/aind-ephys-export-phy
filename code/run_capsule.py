@@ -103,13 +103,11 @@ if __name__ == "__main__":
     logging.info(f"Running export to Phy")
     logging.info(f"\tSAVE_BINARY: {SAVE_BINARY}")
 
-    pipeline_mode = True
     if len(ecephys_sorted_folders) > 0:
         # capsule mode
         assert len(ecephys_sorted_folders) == 1, "Attach one sorted asset at a time"
         ecephys_sorted_folder = ecephys_sorted_folders[0]
         postprocessed_base_folder = ecephys_sorted_folder / "postprocessed"
-        pipeline_mode = False
     elif (data_folder / "postprocessing_pipeline_output_test").is_dir():
         logging.info("\n*******************\n**** TEST MODE ****\n*******************\n")
         preprocessed_base_folder = data_folder / "preprocessing_pipeline_output_test"
@@ -120,14 +118,9 @@ if __name__ == "__main__":
         postprocessed_base_folder = data_folder
         curated_base_folder = data_folder
 
-    if pipeline_mode:
-        postprocessed_folders = [
-            p for p in postprocessed_base_folder.iterdir() if "postprocessed_" in p.name
-        ]
-    else:
-        postprocessed_folders = [
-            p for p in postprocessed_base_folder.iterdir() if "postprocessed-sorting" not in p.name and p.is_dir()
-        ]
+    postprocessed_folders = [
+        p for p in postprocessed_base_folder.iterdir() if "postprocessed_" in p.name
+    ]
     for postprocessed_folder in postprocessed_folders:
         datetime_start_export = datetime.now()
         t_export_start = time.perf_counter()
