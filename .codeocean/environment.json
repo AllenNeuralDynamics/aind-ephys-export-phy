@@ -1,0 +1,38 @@
+{
+	"version": 1,
+	"base_image": "codeocean/mambaforge3:24.5.0-0-python3.12.4-ubuntu22.04",
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true,
+		"mount_secrets": true
+	},
+	"installers": {
+		"apt": {
+			"packages": [
+				{
+					"name": "build-essential",
+					"version": "12.9ubuntu3"
+				}
+			],
+			"install_software_properties_common": true
+		},
+		"pip": {
+			"packages": [
+				{
+					"name": "aind-data-schema",
+					"version": "2.8.1"
+				},
+				{
+					"name": "spikeinterface[full]",
+					"version": "0.104.7"
+				},
+				{
+					"name": "wavpack-numcodecs",
+					"version": "0.2.2"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		}
+	}
+}

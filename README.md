@@ -1,3 +1,3 @@
-# aind-capsule-template
+# aind-ephys-export-phy
 
-Basic structure of a capsule to be customized as needed.
+Capsule to export ecephys pipeline outputs to Phy.

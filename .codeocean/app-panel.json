@@ -1,0 +1,16 @@
+{
+	"version": 1,
+	"parameters": [
+		{
+			"id": "UdhyMK21qToFaUPx",
+			"name": "save binary",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "false",
+			"extra_data": [
+				"false",
+				"true"
+			]
+		}
+	]
+}
