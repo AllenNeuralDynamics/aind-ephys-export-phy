@@ -125,7 +125,7 @@ if __name__ == "__main__":
         datetime_start_export = datetime.now()
         t_export_start = time.perf_counter()
         # Remove 'postprocessed_' for recording_name
-        recording_name = postprocessed_folder[len("postprocessed_"):]
+        recording_name = postprocessed_folder.name[len("postprocessed_"):]
         # Remove ".zarr"
         recording_name = recording_name[:recording_name.find(".zarr")]
         export_output_process_json = results_folder / f"{data_process_prefix}_{recording_name}.json"
