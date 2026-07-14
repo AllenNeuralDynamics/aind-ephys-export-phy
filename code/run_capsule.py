@@ -124,12 +124,10 @@ if __name__ == "__main__":
     for postprocessed_folder in postprocessed_folders:
         datetime_start_export = datetime.now()
         t_export_start = time.perf_counter()
-        if pipeline_mode:
-            recording_name = ("_").join(postprocessed_folder.name.split("_")[1:])
-        else:
-            recording_name = postprocessed_folder.name
-        if recording_name.endswith(".zarr"):
-            recording_name = recording_name[:recording_name.find(".zarr")]
+        # Remove 'postprocessed_' for recording_name
+        recording_name = postprocessed_folder[len("postprocessed_"):]
+        # Remove ".zarr"
+        recording_name = recording_name[:recording_name.find(".zarr")]
         export_output_process_json = results_folder / f"{data_process_prefix}_{recording_name}.json"
         export_output_folder = results_folder / f"phy_{recording_name}"
 
