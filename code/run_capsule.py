@@ -79,7 +79,6 @@ if __name__ == "__main__":
         args.static_save_binary.lower() == "true" if args.static_save_binary
         else args.save_binary
     )
-    SAVE_BINARY = True
     N_JOBS = args.static_n_jobs or args.n_jobs
     N_JOBS = int(N_JOBS) if not N_JOBS.startswith("0.") else float(N_JOBS)
     PARAMS = args.params
@@ -190,6 +189,7 @@ if __name__ == "__main__":
             analyzer,
             output_folder=export_output_folder,
             compute_pc_features=False,
+            add_waveforms=True,
             copy_binary=SAVE_BINARY,
             additional_properties=additional_properties,
             dtype=dtype
