@@ -7,6 +7,7 @@ import os
 import sys
 import argparse
 import json
+import shutil
 from pathlib import Path
 import time
 import logging
@@ -111,7 +112,7 @@ if __name__ == "__main__":
         logging.info("\n*******************\n**** TEST MODE ****\n*******************\n")
         preprocessed_base_folder = data_folder / "preprocessing_pipeline_output_test"
         postprocessed_base_folder = data_folder / "postprocessing_pipeline_output_test"
-        curated_base_folder = data_folder / "curated_pipeline_output_test"
+        curated_base_folder = data_folder / "curation_pipeline_output_test"
     else:
         preprocessed_base_folder = data_folder
         postprocessed_base_folder = data_folder
@@ -179,7 +180,7 @@ if __name__ == "__main__":
                 additional_properties.append(label)
                 analyzer.set_sorting_property(label, labels_df[label], save=False)
         if len(additional_properties) > 0:
-            logging.info(f"Adding {len(additional_properties)} additional properties from curation labels")
+            logging.info(f"\tAdding {len(additional_properties)} additional properties from curation labels")
 
         if SAVE_BINARY and not (analyzer.has_recording() or analyzer.has_temporary_recording()):
             logging.info("Cannot save binary, since recording is not available.")
@@ -192,8 +193,17 @@ if __name__ == "__main__":
             add_waveforms=True,
             copy_binary=SAVE_BINARY,
             additional_properties=additional_properties,
-            dtype=dtype
+            dtype=dtype,
+            verbose=False
         )
+
+        # Copy curation.json to output folder
+        curation_file = curated_base_folder / f"curation_{recording_name}.json"
+        if curation_file.is_file():
+            logging.info(f"\tSaving curation.json to output folder")
+            shutil.copy(curation_file, export_output_folder / "curation.json")
+
+
         t_export_end = time.perf_counter()
         elapsed_time_export = np.round(t_export_end - t_export_start, 2)
 
