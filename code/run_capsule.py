@@ -90,7 +90,8 @@ if __name__ == "__main__":
 
     data_process_prefix = "data_process_export_phy"
 
-    job_kwargs = {"n_jobs": N_JOBS, "progress_bar": False}
+    # spawn: s3fs (recordings stored on S3) is not fork-safe
+    job_kwargs = {"n_jobs": N_JOBS, "progress_bar": False, "mp_context": "spawn"}
     si.set_global_job_kwargs(**job_kwargs)
 
     ecephys_sorted_folders = [
@@ -132,7 +133,9 @@ if __name__ == "__main__":
         export_output_folder = results_folder / f"phy_{recording_name}"
 
         try:
-            analyzer = si.load(postprocessed_folder)
+            # lazy: spikes stay on disk until exported; a non-lazy load holds 2
+            # copies of the spike vector, which does not fit for long recordings
+            analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
             logging.info(f"Exporting recording: {recording_name}")
         except Exception as e:
             logging.info(f"Spike sorting failed on {recording_name}. Skipping export to phy")
@@ -148,13 +151,22 @@ if __name__ == "__main__":
         motion_corrected_folder = preprocessed_base_folder / f"motion_{recording_name}"
 
         recording = None
+        # Without copying the binary, Phy only gets raw data from a local binary
+        # recording, never from one stored on S3: skip loading it from S3 then
+        skip_recording = (
+            not SAVE_BINARY
+            and binary_json_file.is_file()
+            and "s3://" in binary_json_file.read_text()
+        )
         try:
-            if binary_json_file.is_file():
+            if skip_recording:
+                logging.info("\tRecording is on S3 and not saved to binary: not loaded")
+            elif binary_json_file.is_file():
                 recording = si.load(binary_json_file, base_folder=preprocessed_base_folder)
                 logging.info(f"\tLoaded binary recording from JSON")
             else:
                 recording = si.load(preprocessed_base_folder / f"preprocessed_{recording_name}")
-            if recording is None:
+            if recording is None and not skip_recording:
                 try:
                     if preprocessed_json_file.is_file():
                         logging.info(f"\tLoading lazy recording from JSON")
