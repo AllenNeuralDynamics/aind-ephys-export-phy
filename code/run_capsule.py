@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore")
 
 # GENERAL IMPORTS
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -54,6 +55,55 @@ parser.add_argument(
     default=None,
     help="Path to the parameters file or JSON string. If given, it will override all other arguments.",
 )
+
+# Spike times converted per block, to keep memory bounded for billions of spikes
+SPIKE_TIME_BLOCK = 100_000_000
+
+
+def convert_spike_times_to_clock(
+    phy_folder: Path, timestamps: dict, num_frames: int
+) -> str | None:
+    """Rewrite spike_times.npy in clock time, from the timestamp alignment capsule.
+
+    Spike times are frames on the pipeline timeline, where acquisition gaps are
+    absent. They become samples of clock time since the first frame:
+    round((clock(frame) - clock_start) * fs), with clock() the piecewise-linear
+    mapping of timestamps_<recording_name>.json. Spike order is unchanged (the
+    mapping never decreases), so the other Phy files stay aligned.
+
+    Returns why the conversion was skipped, or None if it was applied.
+    """
+    if not timestamps.get("has_timestamps", False):
+        return "the raw recording has no timestamps"
+    if timestamps["pipeline_num_frames"] != num_frames:
+        return (
+            f"it covers {timestamps['pipeline_num_frames']:,} frames but the "
+            f"recording has {num_frames:,}"
+        )
+    # Raw data in Phy is indexed by frame: shifted spike times would not line up
+    if "dat_path = None" not in (phy_folder / "params.py").read_text():
+        return "the export has raw data (dat_path), which is indexed by frame"
+
+    fs = timestamps["sampling_frequency"]
+    mapping_frames = np.asarray(timestamps["mapping"]["pipeline_frame"], dtype=np.float64)
+    mapping_clock = np.asarray(timestamps["mapping"]["clock_s"], dtype=np.float64)
+    clock_start = timestamps["clock_start_s"]
+
+    spike_times = np.load(phy_folder / "spike_times.npy", mmap_mode="r+")
+    previous_last = None
+    for i0 in range(0, spike_times.shape[0], SPIKE_TIME_BLOCK):
+        frames = spike_times[i0 : i0 + SPIKE_TIME_BLOCK, 0]
+        clock = np.interp(frames, mapping_frames, mapping_clock)
+        converted = np.round((clock - clock_start) * fs).astype(spike_times.dtype)
+        if np.any(np.diff(converted) < 0) or (
+            previous_last is not None and converted[0] < previous_last
+        ):
+            raise RuntimeError("Converted spike times are not in order")
+        spike_times[i0 : i0 + SPIKE_TIME_BLOCK, 0] = converted
+        previous_last = converted[-1]
+    spike_times.flush()
+    del spike_times
+    return None
 
 
 if __name__ == "__main__":
@@ -217,6 +267,32 @@ if __name__ == "__main__":
             dtype=dtype,
             verbose=False,
         )
+
+        # Spike times in clock time, if the timestamp alignment capsule ran;
+        # otherwise they stay in frames, as before
+        timestamps_file = next(
+            data_folder.rglob(f"timestamps_{recording_name}.json"), None
+        )
+        if timestamps_file is None:
+            logging.info("\tNo timestamps file: spike_times stay in frames")
+        else:
+            timestamps = json.loads(timestamps_file.read_text())
+            skipped = convert_spike_times_to_clock(
+                export_output_folder, timestamps, analyzer.get_num_samples()
+            )
+            if skipped is None:
+                shutil.copy(timestamps_file, export_output_folder / "timestamps.json")
+                note = (
+                    f"spike_times converted to clock time from {timestamps_file.name} "
+                    f"({len(timestamps['gaps'])} gap(s), "
+                    f"{timestamps['total_gap_s'] / 3600:.2f} h)"
+                )
+                logging.info(f"\t{note}")
+                export_notes += f"\n- {note}.\n"
+            else:
+                logging.warning(
+                    f"\tNot converting spike_times with {timestamps_file.name}: {skipped}"
+                )
 
         # Copy curation.json to output folder
         curation_file = curated_base_folder / f"curation_{recording_name}.json"
