@@ -3,32 +3,26 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # GENERAL IMPORTS
-import os
-import sys
 import argparse
-import json
-import shutil
-from pathlib import Path
-import time
 import logging
-from copy import deepcopy
+import os
+import shutil
+import sys
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 # SPIKEINTERFACE
 import spikeinterface as si
-from spikeinterface.core.core_tools import check_json
-import spikeinterface.qualitymetrics as sqm
 import spikeinterface.exporters as sexp
-
+from aind_data_schema.components.identifiers import Code
 
 # AIND
 from aind_data_schema.core.processing import DataProcess, ProcessStage
-from aind_data_schema.components.identifiers import Code
 from aind_data_schema_models.process_names import ProcessName
-
 
 URL = "https://github.com/AllenNeuralDynamics/aind-ephys-export-phy"
 VERSION = "2.0"
@@ -42,7 +36,9 @@ parser = argparse.ArgumentParser(description="Curate ecephys data")
 
 save_binary_group = parser.add_mutually_exclusive_group()
 save_binary_help = "Whether to save the recording to binary"
-save_binary_group.add_argument("--save-binary", action="store_true", help=save_binary_help)
+save_binary_group.add_argument(
+    "--save-binary", action="store_true", help=save_binary_help
+)
 save_binary_group.add_argument("static_save_binary", nargs="?", help=save_binary_help)
 
 n_jobs_group = parser.add_mutually_exclusive_group()
@@ -53,20 +49,11 @@ n_jobs_help = (
 n_jobs_group.add_argument("static_n_jobs", nargs="?", default="-1", help=n_jobs_help)
 n_jobs_group.add_argument("--n-jobs", default="-1", help=n_jobs_help)
 
-parser.add_argument("--params", default=None, help="Path to the parameters file or JSON string. If given, it will override all other arguments.")
-
-
-def create_mock_results(recording_name, include_qc=True, include_classifier=True):
-    """Creates mock curation results.
-
-    Parameters
-    ----------
-    recording_name : str
-        The name of the recording for which to create mock results.
-        This is used to name the output files.
-    """
-    # TODO: create empty folder
-    pass
+parser.add_argument(
+    "--params",
+    default=None,
+    help="Path to the parameters file or JSON string. If given, it will override all other arguments.",
+)
 
 
 if __name__ == "__main__":
@@ -77,7 +64,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     SAVE_BINARY = (
-        args.static_save_binary.lower() == "true" if args.static_save_binary
+        args.static_save_binary.lower() == "true"
+        if args.static_save_binary
         else args.save_binary
     )
     N_JOBS = args.static_n_jobs or args.n_jobs
@@ -97,11 +85,14 @@ if __name__ == "__main__":
     ecephys_sorted_folders = [
         p
         for p in data_folder.iterdir()
-        if p.is_dir() and "ecephys" in p.name or "behavior" in p.name and "sorted" in p.name
+        if p.is_dir()
+        and "ecephys" in p.name
+        or "behavior" in p.name
+        and "sorted" in p.name
     ]
 
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
-    logging.info(f"Running export to Phy")
+    logging.info("Running export to Phy")
     logging.info(f"\tSAVE_BINARY: {SAVE_BINARY}")
 
     if len(ecephys_sorted_folders) > 0:
@@ -110,7 +101,9 @@ if __name__ == "__main__":
         ecephys_sorted_folder = ecephys_sorted_folders[0]
         postprocessed_base_folder = ecephys_sorted_folder / "postprocessed"
     elif (data_folder / "postprocessing_pipeline_output_test").is_dir():
-        logging.info("\n*******************\n**** TEST MODE ****\n*******************\n")
+        logging.info(
+            "\n*******************\n**** TEST MODE ****\n*******************\n"
+        )
         preprocessed_base_folder = data_folder / "preprocessing_pipeline_output_test"
         postprocessed_base_folder = data_folder / "postprocessing_pipeline_output_test"
         curated_base_folder = data_folder / "curation_pipeline_output_test"
@@ -126,10 +119,12 @@ if __name__ == "__main__":
         datetime_start_export = datetime.now()
         t_export_start = time.perf_counter()
         # Remove 'postprocessed_' for recording_name
-        recording_name = postprocessed_folder.name[len("postprocessed_"):]
+        recording_name = postprocessed_folder.name[len("postprocessed_") :]
         # Remove ".zarr"
-        recording_name = recording_name[:recording_name.find(".zarr")]
-        export_output_process_json = results_folder / f"{data_process_prefix}_{recording_name}.json"
+        recording_name = recording_name[: recording_name.find(".zarr")]
+        export_output_process_json = (
+            results_folder / f"{data_process_prefix}_{recording_name}.json"
+        )
         export_output_folder = results_folder / f"phy_{recording_name}"
 
         try:
@@ -137,8 +132,10 @@ if __name__ == "__main__":
             # copies of the spike vector, which does not fit for long recordings
             analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
             logging.info(f"Exporting recording: {recording_name}")
-        except Exception as e:
-            logging.info(f"Spike sorting failed on {recording_name}. Skipping export to phy")
+        except Exception:
+            logging.info(
+                f"Spike sorting failed on {recording_name}. Skipping export to phy"
+            )
             # create an empty result file (needed for pipeline)
             export_output_folder.mkdir()
             error_file = export_output_folder / "error.txt"
@@ -147,7 +144,9 @@ if __name__ == "__main__":
 
         # Load preprocessed data
         binary_json_file = preprocessed_base_folder / f"binary_{recording_name}.json"
-        preprocessed_json_file = preprocessed_base_folder / f"preprocessed_{recording_name}.json"
+        preprocessed_json_file = (
+            preprocessed_base_folder / f"preprocessed_{recording_name}.json"
+        )
         motion_corrected_folder = preprocessed_base_folder / f"motion_{recording_name}"
 
         recording = None
@@ -162,15 +161,21 @@ if __name__ == "__main__":
             if skip_recording:
                 logging.info("\tRecording is on S3 and not saved to binary: not loaded")
             elif binary_json_file.is_file():
-                recording = si.load(binary_json_file, base_folder=preprocessed_base_folder)
-                logging.info(f"\tLoaded binary recording from JSON")
+                recording = si.load(
+                    binary_json_file, base_folder=preprocessed_base_folder
+                )
+                logging.info("\tLoaded binary recording from JSON")
             else:
-                recording = si.load(preprocessed_base_folder / f"preprocessed_{recording_name}")
+                recording = si.load(
+                    preprocessed_base_folder / f"preprocessed_{recording_name}"
+                )
             if recording is None and not skip_recording:
                 try:
                     if preprocessed_json_file.is_file():
-                        logging.info(f"\tLoading lazy recording from JSON")
-                        recording = si.load(preprocessed_json_file, base_folder=data_folder)
+                        logging.info("\tLoading lazy recording from JSON")
+                        recording = si.load(
+                            preprocessed_json_file, base_folder=data_folder
+                        )
                 except:
                     logging.info("Could not load lazy preprocessed recording")
         except Exception as e:
@@ -192,9 +197,13 @@ if __name__ == "__main__":
                 additional_properties.append(label)
                 analyzer.set_sorting_property(label, labels_df[label], save=False)
         if len(additional_properties) > 0:
-            logging.info(f"\tAdding {len(additional_properties)} additional properties from curation labels")
+            logging.info(
+                f"\tAdding {len(additional_properties)} additional properties from curation labels"
+            )
 
-        if SAVE_BINARY and not (analyzer.has_recording() or analyzer.has_temporary_recording()):
+        if SAVE_BINARY and not (
+            analyzer.has_recording() or analyzer.has_temporary_recording()
+        ):
             logging.info("Cannot save binary, since recording is not available.")
             SAVE_BINARY = False
 
@@ -206,19 +215,17 @@ if __name__ == "__main__":
             copy_binary=SAVE_BINARY,
             additional_properties=additional_properties,
             dtype=dtype,
-            verbose=False
+            verbose=False,
         )
 
         # Copy curation.json to output folder
         curation_file = curated_base_folder / f"curation_{recording_name}.json"
         if curation_file.is_file():
-            logging.info(f"\tSaving curation.json to output folder")
+            logging.info("\tSaving curation.json to output folder")
             shutil.copy(curation_file, export_output_folder / "curation.json")
-
 
         t_export_end = time.perf_counter()
         elapsed_time_export = np.round(t_export_end - t_export_start, 2)
-
 
         export_process = DataProcess(
             process_type=ProcessName.EPHYS_CURATION,
@@ -227,11 +234,12 @@ if __name__ == "__main__":
             experimenters=["AIND Pipeline"],
             code=Code(
                 url=URL,
-                version=VERSION, # either release or git commit
-                parameters={}
+                version=VERSION,  # either release or git commit
+                parameters={},
             ),
             start_date_time=datetime_start_export,
-            end_date_time=datetime_start_export + timedelta(seconds=np.floor(elapsed_time_export)),
+            end_date_time=datetime_start_export
+            + timedelta(seconds=np.floor(elapsed_time_export)),
             output_path=str(results_folder),
             output_parameters={},
             notes=export_notes,
