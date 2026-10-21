@@ -89,6 +89,64 @@ def load_extension_data_in_memory(analyzer) -> None:
                 extension.data[key] = np.asarray(value)
 
 
+SUBSET = "_phy_spikes_subset"
+# Selected spikes whose frames are checked against the sorting
+SUBSET_CHECK_SPIKES = 10_000
+
+
+def find_sampled_waveforms(recording_name: str, analyzer) -> Path | None:
+    """The waveform sampling capsule's folder for this recording, if it matches.
+
+    The sampled spikes are rows of the sorting's spike vector, so they are only
+    used when the folder was made from this sorting: same spike and unit counts,
+    unit ids, waveform length, and frames of a sample of the selected spikes.
+    """
+    folder = next(
+        (p for p in data_folder.rglob(f"phy_waveforms_{recording_name}") if p.is_dir()), None
+    )
+    if folder is None:
+        return None
+    manifest_file = folder / f"{SUBSET}.manifest.json"
+    if not manifest_file.is_file():
+        logging.warning(f"\t{folder.name} has no manifest: not using it")
+        return None
+    manifest = json.loads(manifest_file.read_text())
+    source = manifest.get("source_sorting", {})
+    spike_vector = analyzer.sorting.to_spike_vector()
+    templates_ext = analyzer.get_extension("templates")
+    reasons = []
+    if manifest.get("format") != "phy_spikes_subset" or manifest.get("format_version") != 1:
+        reasons.append("unknown format")
+    if source.get("num_spikes") != len(spike_vector):
+        reasons.append(f"{source.get('num_spikes')} spikes vs {len(spike_vector)} in the sorting")
+    if source.get("unit_ids") != [str(u) for u in analyzer.unit_ids]:
+        reasons.append("different unit ids")
+    extraction = manifest.get("waveform_extraction", {})
+    if templates_ext is not None and (
+        extraction.get("nbefore_samples") != templates_ext.nbefore
+        or extraction.get("nafter_samples") != templates_ext.nafter
+    ):
+        reasons.append("waveform length differs from the templates")
+    if not reasons:
+        rows = np.load(folder / f"{SUBSET}.spikes.npy", mmap_mode="r")
+        frames = np.load(folder / f"{SUBSET}.sample_index.npy", mmap_mode="r")
+        check = np.unique(np.linspace(0, rows.size - 1, min(rows.size, SUBSET_CHECK_SPIKES)).astype(np.int64))
+        if rows.size:
+            sample_index = spike_vector["sample_index"]
+            check_rows = np.asarray(rows[check])
+            # zarr (lazy analyzer) or numpy
+            sorting_frames = (
+                sample_index.oindex[check_rows] if hasattr(sample_index, "oindex")
+                else np.asarray(sample_index)[check_rows]
+            )
+            if not np.array_equal(sorting_frames, np.asarray(frames[check])):
+                reasons.append("selected spikes' frames differ from the sorting")
+    if reasons:
+        logging.warning(f"\tNot using {folder.name}: {'; '.join(reasons)}")
+        return None
+    return folder
+
+
 def convert_spike_times_to_clock(
     phy_folder: Path, timestamps: dict, num_frames: int
 ) -> str | None:
@@ -297,16 +355,28 @@ if __name__ == "__main__":
 
         load_extension_data_in_memory(analyzer)
 
+        # Waveforms sampled from shared temporal windows (waveform sampling
+        # capsule) if present; otherwise the analyzer's random_spikes, as before
+        sampled_waveforms = find_sampled_waveforms(recording_name, analyzer)
+        if sampled_waveforms is not None:
+            logging.info(f"\tUsing sampled waveforms from {sampled_waveforms.name}")
+        else:
+            logging.info("\tUsing the analyzer's random_spikes waveforms")
+
         sexp.export_to_phy(
             analyzer,
             output_folder=export_output_folder,
             compute_pc_features=False,
-            add_waveforms=True,
+            add_waveforms=sampled_waveforms is None,
             copy_binary=SAVE_BINARY,
             additional_properties=additional_properties,
             dtype=dtype,
             verbose=False,
         )
+        if sampled_waveforms is not None:
+            for subset_file in sorted(sampled_waveforms.glob(f"{SUBSET}.*")):
+                shutil.copy(subset_file, export_output_folder / subset_file.name)
+            export_notes += f"\n- Waveforms from {sampled_waveforms.name}.\n"
 
         # Spike times in clock time, if the timestamp alignment capsule ran;
         # otherwise they stay in frames, as before
