@@ -390,8 +390,9 @@ if __name__ == "__main__":
             skipped = convert_spike_times_to_clock(
                 export_output_folder, timestamps, analyzer.get_num_samples()
             )
+            # Kept with the Phy output either way (frame to clock-time mapping, gaps)
+            shutil.copy(timestamps_file, export_output_folder / "timestamps.json")
             if skipped is None:
-                shutil.copy(timestamps_file, export_output_folder / "timestamps.json")
                 note = (
                     f"spike_times converted to clock time from {timestamps_file.name} "
                     f"({len(timestamps['gaps'])} gap(s), "
@@ -401,7 +402,8 @@ if __name__ == "__main__":
                 export_notes += f"\n- {note}.\n"
             else:
                 logging.warning(
-                    f"\tNot converting spike_times with {timestamps_file.name}: {skipped}"
+                    f"\tNot converting spike_times with {timestamps_file.name}: {skipped}. "
+                    "timestamps.json is in the Phy folder, but spike_times stay in frames"
                 )
 
         # Copy curation.json to output folder
