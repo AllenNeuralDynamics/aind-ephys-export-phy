@@ -209,17 +209,9 @@ if __name__ == "__main__":
         export_output_folder = results_folder / f"phy_{recording_name}"
 
         try:
-            try:
-                # lazy: spikes stay on disk until exported; a non-lazy load holds 2
-                # copies of the spike vector, which does not fit for long recordings
-                analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
-            except Exception as lazy_error:
-                # Fall back to the previous (non-lazy) load
-                logging.warning(
-                    f"\tLazy load of {postprocessed_folder.name} failed "
-                    f"({type(lazy_error).__name__}: {lazy_error}); loading it fully"
-                )
-                analyzer = si.load(postprocessed_folder)
+            # lazy: spikes stay on disk until exported; a non-lazy load holds 2
+            # copies of the spike vector, which does not fit for long recordings
+            analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
             logging.info(f"Exporting recording: {recording_name}")
         except Exception as e:
             logging.info(
