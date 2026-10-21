@@ -181,18 +181,33 @@ if __name__ == "__main__":
         export_output_folder = results_folder / f"phy_{recording_name}"
 
         try:
-            # lazy: spikes stay on disk until exported; a non-lazy load holds 2
-            # copies of the spike vector, which does not fit for long recordings
-            analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
+            try:
+                # lazy: spikes stay on disk until exported; a non-lazy load holds 2
+                # copies of the spike vector, which does not fit for long recordings
+                analyzer = si.load_sorting_analyzer(postprocessed_folder, lazy=True)
+            except Exception as lazy_error:
+                # Fall back to the previous (non-lazy) load
+                logging.warning(
+                    f"\tLazy load of {postprocessed_folder.name} failed "
+                    f"({type(lazy_error).__name__}: {lazy_error}); loading it fully"
+                )
+                analyzer = si.load(postprocessed_folder)
             logging.info(f"Exporting recording: {recording_name}")
-        except Exception:
+        except Exception as e:
             logging.info(
-                f"Spike sorting failed on {recording_name}. Skipping export to phy"
+                f"Spike sorting failed on {recording_name}. Skipping export to phy "
+                f"(could not load {postprocessed_folder.name}: {type(e).__name__}: {e})"
             )
+            if postprocessed_folder.is_dir():
+                contents = sorted(p.name for p in postprocessed_folder.iterdir())[:20]
+                logging.info(f"\t{postprocessed_folder.name} contains: {contents}")
             # create an empty result file (needed for pipeline)
             export_output_folder.mkdir()
             error_file = export_output_folder / "error.txt"
-            error_file.write_text("Spike sorting failed.")
+            error_file.write_text(
+                f"Spike sorting failed.\nCould not load {postprocessed_folder.name}: "
+                f"{type(e).__name__}: {e}\n"
+            )
             continue
 
         # Load preprocessed data
