@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -80,8 +81,10 @@ def convert_spike_times_to_clock(
             f"it covers {timestamps['pipeline_num_frames']:,} frames but the "
             f"recording has {num_frames:,}"
         )
-    # Raw data in Phy is indexed by frame: shifted spike times would not line up
-    if "dat_path = None" not in (phy_folder / "params.py").read_text():
+    # Raw data in Phy is indexed by frame: shifted spike times would not line up.
+    # Without raw data, params.py has dat_path = None or (absolute paths) r'None'
+    params_text = (phy_folder / "params.py").read_text()
+    if not re.search(r"""^dat_path\s*=\s*(?:None|r?['"]None['"])\s*$""", params_text, re.M):
         return "the export has raw data (dat_path), which is indexed by frame"
 
     fs = timestamps["sampling_frequency"]
