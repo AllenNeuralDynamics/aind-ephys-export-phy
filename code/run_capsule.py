@@ -60,6 +60,34 @@ parser.add_argument(
 # Spike times converted per block, to keep memory bounded for billions of spikes
 SPIKE_TIME_BLOCK = 100_000_000
 
+# Extensions export_to_phy reads (PCs are not exported)
+PHY_EXTENSIONS = (
+    "random_spikes",
+    "waveforms",
+    "templates",
+    "template_similarity",
+    "spike_amplitudes",
+    "quality_metrics",
+    "template_metrics",
+)
+
+
+def load_extension_data_in_memory(analyzer) -> None:
+    """Read the data of the extensions export_to_phy uses into numpy arrays.
+
+    A lazily loaded analyzer keeps extension data in zarr arrays, which
+    export_to_phy indexes like numpy (e.g. amplitudes[:, np.newaxis]) and fails
+    on. The spike vector itself stays lazy.
+    """
+    for name in PHY_EXTENSIONS:
+        extension = analyzer.get_extension(name)
+        if extension is None:
+            continue
+        for key, value in extension.data.items():
+            # zarr (or other array-like) data; DataFrames and numpy arrays stay
+            if not isinstance(value, np.ndarray) and hasattr(value, "shape") and hasattr(value, "dtype"):
+                extension.data[key] = np.asarray(value)
+
 
 def convert_spike_times_to_clock(
     phy_folder: Path, timestamps: dict, num_frames: int
@@ -274,6 +302,8 @@ if __name__ == "__main__":
         ):
             logging.info("Cannot save binary, since recording is not available.")
             SAVE_BINARY = False
+
+        load_extension_data_in_memory(analyzer)
 
         sexp.export_to_phy(
             analyzer,
