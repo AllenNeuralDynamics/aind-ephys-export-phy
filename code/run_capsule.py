@@ -359,7 +359,9 @@ def convert_export_to_clock(
             recording["time_base"] = time_base
             recording["sample_index_coordinates"] = "elapsed_ticks"
             recording["window_bounds_coordinates"] = "elapsed_ticks"
-            recording["frame_coordinates"] = (
+            # Must name the time base's kind (Phy PR #1428 validates it)
+            recording["frame_coordinates"] = time_base["kind"]
+            recording["frame_coordinates_description"] = (
                 "elapsed clock ticks, as spike_times.npy: round((clock_s - clock_start_s) "
                 "* sampling_frequency_hz), with clock_s from timestamps.json; num_frames "
                 "is the analyzer's frame count"
