@@ -147,43 +147,100 @@ def find_sampled_waveforms(recording_name: str, analyzer) -> Path | None:
     return folder
 
 
-def convert_spike_times_to_clock(
+# Phy files with one row per spike (pc_features only if PCs were exported)
+PER_SPIKE_FILES = (
+    "spike_times.npy",
+    "spike_templates.npy",
+    "spike_clusters.npy",
+    "amplitudes.npy",
+    "pc_features.npy",
+)
+# Waveform subset files with one row per stored waveform
+PER_WAVEFORM_FILES = ("spikes", "channels", "waveforms", "sample_index")
+
+
+def _remove_rows(path: Path, rows: np.ndarray) -> None:
+    """Rewrite a .npy without the given rows (sorted, unique), in blocks."""
+    source = np.load(path, mmap_mode="r")
+    temporary = path.with_name(f"{path.stem}.tmp.npy")
+    target = np.lib.format.open_memmap(
+        temporary,
+        mode="w+",
+        dtype=source.dtype,
+        shape=(source.shape[0] - rows.size, *source.shape[1:]),
+    )
+    # Kept runs between removed rows
+    edges = np.concatenate([[-1], rows, [source.shape[0]]])
+    out = 0
+    for run_start, run_end in zip(edges[:-1] + 1, edges[1:]):
+        for i0 in range(run_start, run_end, SPIKE_TIME_BLOCK):
+            i1 = min(i0 + SPIKE_TIME_BLOCK, run_end)
+            target[out : out + i1 - i0] = source[i0:i1]
+            out += i1 - i0
+    target.flush()
+    del target, source
+    os.replace(temporary, path)
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sorted, non-overlapping [start, end) intervals (touching ones joined)."""
+    merged = []
+    for start, end in sorted(i for i in intervals if i[1] > i[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def convert_export_to_clock(
     phy_folder: Path, timestamps: dict, num_frames: int
-) -> str | None:
-    """Rewrite spike_times.npy in clock time, from the timestamp alignment capsule.
+) -> tuple[str | None, dict]:
+    """Put every time of the Phy export in clock time, from the timestamp alignment capsule.
 
-    Spike times are frames on the pipeline timeline, where acquisition gaps are
-    absent. They become samples of clock time since the first frame:
-    round((clock(frame) - clock_start) * fs), with clock() the piecewise-linear
-    mapping of timestamps_<recording_name>.json. Spike order is unchanged (the
-    mapping never decreases), so the other Phy files stay aligned.
+    Frames on the pipeline timeline, where acquisition gaps are absent, become
+    ticks of clock time since the first frame: round((clock(frame) - clock_start) * fs),
+    with clock() the piecewise-linear mapping of timestamps_<recording_name>.json.
+    This applies to spike_times.npy and, when present, to the waveform subset's
+    sample_index and window_bounds, with num_samples in clock ticks.
 
-    Returns why the conversion was skipped, or None if it was applied.
+    The gaps (no samples) and filler regions (padding samples, zero traces) are
+    left out of valid_intervals, written to params.py and the subset manifest.
+    The few spikes that fall inside them are removed from every per-spike file
+    and listed in removed_spikes_outside_valid_intervals.csv; stored waveforms
+    follow their spikes.
+
+    Returns (why the conversion was skipped or None, summary).
     """
     if not timestamps.get("has_timestamps", False):
-        return "the raw recording has no timestamps"
+        return "the raw recording has no timestamps", {}
     if timestamps["pipeline_num_frames"] != num_frames:
         return (
             f"it covers {timestamps['pipeline_num_frames']:,} frames but the "
             f"recording has {num_frames:,}"
-        )
+        ), {}
     # Raw data in Phy is indexed by frame: shifted spike times would not line up.
     # Without raw data, params.py has dat_path = None or (absolute paths) r'None'
     params_text = (phy_folder / "params.py").read_text()
     if not re.search(r"""^dat_path\s*=\s*(?:None|r?['"]None['"])\s*$""", params_text, re.M):
-        return "the export has raw data (dat_path), which is indexed by frame"
+        return "the export has raw data (dat_path), which is indexed by frame", {}
 
     fs = timestamps["sampling_frequency"]
     mapping_frames = np.asarray(timestamps["mapping"]["pipeline_frame"], dtype=np.float64)
     mapping_clock = np.asarray(timestamps["mapping"]["clock_s"], dtype=np.float64)
     clock_start = timestamps["clock_start_s"]
 
+    def to_ticks(frames) -> np.ndarray:
+        clock = np.interp(np.asarray(frames, dtype=np.float64), mapping_frames, mapping_clock)
+        return np.round((clock - clock_start) * fs).astype(np.int64)
+
+    # ── spike_times ─────────────────────────────────────────────────────────
     spike_times = np.load(phy_folder / "spike_times.npy", mmap_mode="r+")
     previous_last = None
     for i0 in range(0, spike_times.shape[0], SPIKE_TIME_BLOCK):
-        frames = spike_times[i0 : i0 + SPIKE_TIME_BLOCK, 0]
-        clock = np.interp(frames, mapping_frames, mapping_clock)
-        converted = np.round((clock - clock_start) * fs).astype(spike_times.dtype)
+        converted = to_ticks(spike_times[i0 : i0 + SPIKE_TIME_BLOCK, 0]).astype(
+            spike_times.dtype
+        )
         if np.any(np.diff(converted) < 0) or (
             previous_last is not None and converted[0] < previous_last
         ):
@@ -192,7 +249,146 @@ def convert_spike_times_to_clock(
         previous_last = converted[-1]
     spike_times.flush()
     del spike_times
-    return None
+
+    # ── Recording length and valid intervals, in ticks ──────────────────────
+    time_base = {"kind": "elapsed_ticks", "ticks_per_second": fs}
+    # Ticks [0, num_ticks): up to just after the last frame
+    num_ticks = int(to_ticks(num_frames - 1)) + 1
+    invalid = []
+    for region in timestamps.get("filler_regions", []):
+        invalid.append(
+            (int(to_ticks(region["pipeline_start"])), int(to_ticks(region["pipeline_end"] - 1)) + 1)
+        )
+    for gap in timestamps.get("gaps", []):
+        # Clock time between the last sample before the gap and the first after it
+        frame = gap["pipeline_frame"]
+        invalid.append((int(to_ticks(frame - 1)) + 1, int(to_ticks(frame))))
+    invalid = _merge_intervals([(max(0, a), min(num_ticks, b)) for a, b in invalid])
+    valid, position = [], 0
+    for start, end in invalid:
+        if start > position:
+            valid.append((position, start))
+        position = end
+    if position < num_ticks:
+        valid.append((position, num_ticks))
+
+    # ── Spikes outside the valid intervals ──────────────────────────────────
+    spike_times = np.load(phy_folder / "spike_times.npy", mmap_mode="r")[:, 0]
+    removed = np.unique(
+        np.concatenate(
+            [
+                np.arange(np.searchsorted(spike_times, a), np.searchsorted(spike_times, b))
+                for a, b in invalid
+            ]
+            + [np.zeros(0, dtype=np.int64)]
+        )
+    ).astype(np.int64)
+    num_spikes = spike_times.shape[0]
+    if removed.size:
+        clusters = np.load(phy_folder / "spike_clusters.npy", mmap_mode="r")[:, 0]
+        pd.DataFrame(
+            {
+                "spike_row": removed,
+                "cluster_id": np.asarray(clusters[removed]),
+                "clock_tick": np.asarray(spike_times[removed]),
+                "clock_s_from_start": np.asarray(spike_times[removed]) / fs,
+            }
+        ).to_csv(phy_folder / "removed_spikes_outside_valid_intervals.csv", index=False)
+        del clusters
+    del spike_times
+    for name in PER_SPIKE_FILES:
+        if removed.size and (phy_folder / name).is_file():
+            _remove_rows(phy_folder / name, removed)
+
+    # ── Waveform subset: rows follow the removal, times become ticks ────────
+    subset_spikes_file = phy_folder / f"{SUBSET}.spikes.npy"
+    removed_waveforms = 0
+    if subset_spikes_file.is_file():
+        rows = np.load(subset_spikes_file)
+        dropped = np.flatnonzero(np.isin(rows, removed))
+        removed_waveforms = int(dropped.size)
+        if dropped.size:
+            for name in PER_WAVEFORM_FILES:
+                path = phy_folder / f"{SUBSET}.{name}.npy"
+                if path.is_file():
+                    _remove_rows(path, dropped)
+            rows = np.load(subset_spikes_file)
+        # Same rows in the shortened per-spike files
+        np.save(subset_spikes_file, rows - np.searchsorted(removed, rows))
+
+        sample_index_file = phy_folder / f"{SUBSET}.sample_index.npy"
+        if sample_index_file.is_file():
+            ticks = to_ticks(np.load(sample_index_file))
+            np.save(sample_index_file, ticks)
+            # The stored waveforms' times must be their spikes' times
+            spike_times = np.load(phy_folder / "spike_times.npy", mmap_mode="r")[:, 0]
+            rows = np.load(subset_spikes_file)
+            check = np.unique(
+                np.linspace(0, rows.size - 1, min(rows.size, SUBSET_CHECK_SPIKES)).astype(np.int64)
+            )
+            if rows.size and not np.array_equal(np.asarray(spike_times[rows[check]]), ticks[check]):
+                raise RuntimeError("Stored waveform times differ from their spike times")
+            del spike_times
+        window_bounds_file = phy_folder / f"{SUBSET}.window_bounds.npy"
+        bridging_windows = []
+        if window_bounds_file.is_file():
+            bounds = np.load(window_bounds_file)
+            # [start, end) frames → [start, end) ticks
+            tick_bounds = np.stack(
+                [to_ticks(bounds[:, 0]), to_ticks(bounds[:, 1] - 1) + 1], axis=1
+            )
+            np.save(window_bounds_file, tick_bounds)
+            # Windows must not span a gap or filler (waveform sampling avoids them)
+            bridging_windows = [
+                int(w)
+                for w, (start, end) in enumerate(tick_bounds)
+                if any(a < end and b > start for a, b in invalid)
+            ]
+            if bridging_windows:
+                logging.warning(
+                    f"\t{len(bridging_windows)} waveform window(s) overlap a gap or filler "
+                    f"interval: {bridging_windows}. They come from waveform sampling run "
+                    "without gap-aware window selection; rerun it to replace them."
+                )
+        manifest_file = phy_folder / f"{SUBSET}.manifest.json"
+        if manifest_file.is_file():
+            manifest = json.loads(manifest_file.read_text())
+            recording = manifest["recording"]
+            recording["num_frames"] = recording["num_samples"]
+            recording["num_samples"] = num_ticks
+            recording["time_base"] = time_base
+            recording["sample_index_coordinates"] = "elapsed_ticks"
+            recording["window_bounds_coordinates"] = "elapsed_ticks"
+            recording["frame_coordinates"] = (
+                "elapsed clock ticks, as spike_times.npy: round((clock_s - clock_start_s) "
+                "* sampling_frequency_hz), with clock_s from timestamps.json; num_frames "
+                "is the analyzer's frame count"
+            )
+            recording["valid_intervals"] = [list(v) for v in valid]
+            if bridging_windows:
+                recording["windows_overlapping_invalid_intervals"] = bridging_windows
+            source = manifest["source_sorting"]
+            source["num_spikes_in_sorting"] = source["num_spikes"]
+            source["num_spikes"] = int(num_spikes - removed.size)
+            source["removed_spikes_outside_valid_intervals"] = int(removed.size)
+            manifest_file.write_text(json.dumps(manifest, indent=2))
+
+    # ── params.py: time base, length and valid intervals (same as the manifest) ──
+    params_text = params_text.rstrip("\n") + "\n"
+    params_text += f"time_base = {time_base!r}\n"
+    params_text += f"num_samples = {num_ticks}\n"
+    params_text += f"valid_intervals = {[list(v) for v in valid]}\n"
+    (phy_folder / "params.py").write_text(params_text)
+
+    return None, {
+        "num_ticks": num_ticks,
+        "num_valid_intervals": len(valid),
+        "num_invalid_intervals": len(invalid),
+        "invalid_s": sum(b - a for a, b in invalid) / fs,
+        "removed_spikes": int(removed.size),
+        "removed_waveforms": removed_waveforms,
+        "bridging_windows": len(bridging_windows) if subset_spikes_file.is_file() else 0,
+    }
 
 
 if __name__ == "__main__":
@@ -387,19 +583,30 @@ if __name__ == "__main__":
             logging.info("\tNo timestamps file: spike_times stay in frames")
         else:
             timestamps = json.loads(timestamps_file.read_text())
-            skipped = convert_spike_times_to_clock(
+            skipped, summary = convert_export_to_clock(
                 export_output_folder, timestamps, analyzer.get_num_samples()
             )
             # Kept with the Phy output either way (frame to clock-time mapping, gaps)
             shutil.copy(timestamps_file, export_output_folder / "timestamps.json")
             if skipped is None:
                 note = (
-                    f"spike_times converted to clock time from {timestamps_file.name} "
-                    f"({len(timestamps['gaps'])} gap(s), "
-                    f"{timestamps['total_gap_s'] / 3600:.2f} h)"
+                    f"spike times, waveform windows and sample indices converted to "
+                    f"clock time from {timestamps_file.name} ({len(timestamps['gaps'])} "
+                    f"gap(s), {timestamps['total_gap_s'] / 3600:.2f} h); num_samples "
+                    f"{summary['num_ticks']:,} clock ticks, {summary['num_valid_intervals']} "
+                    f"valid interval(s) ({summary['num_invalid_intervals']} gap/filler "
+                    f"interval(s), {summary['invalid_s']:,.0f} s, excluded)"
                 )
                 logging.info(f"\t{note}")
                 export_notes += f"\n- {note}.\n"
+                if summary["removed_spikes"]:
+                    note = (
+                        f"{summary['removed_spikes']:,} spike(s) inside gap/filler intervals "
+                        f"removed (removed_spikes_outside_valid_intervals.csv), with "
+                        f"{summary['removed_waveforms']:,} stored waveform(s)"
+                    )
+                    logging.info(f"\t{note}")
+                    export_notes += f"\n- {note}.\n"
             else:
                 logging.warning(
                     f"\tNot converting spike_times with {timestamps_file.name}: {skipped}. "
