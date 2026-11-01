@@ -11,6 +11,19 @@
 				"false",
 				"true"
 			]
+		},
+		{
+			"id": "SxCSm11aHuLWnwhQ",
+			"name": "phy export mode",
+			"description": "Modes: subsampled (waveform sampling), full (random spikes), or both (two folders)",
+			"type": "list",
+			"value_type": "string",
+			"default_value": "subsampled",
+			"extra_data": [
+				"full",
+				"subsampled",
+				"both"
+			]
 		}
 	]
 }
