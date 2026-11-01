@@ -43,6 +43,18 @@ save_binary_group.add_argument(
 )
 save_binary_group.add_argument("static_save_binary", nargs="?", help=save_binary_help)
 
+# Second positional argument: the App Panel's second parameter
+phy_export_group = parser.add_mutually_exclusive_group()
+phy_export_help = (
+    "Which Phy export to write: 'subsampled' (default; waveforms from the waveform "
+    "sampling capsule), 'full' (the analyzer's random_spikes waveforms, as "
+    "export_to_phy writes them) or 'both' (phy_<recording>/phy-full and "
+    "phy_<recording>/phy-subsampled). Spike times are in clock time in every case, "
+    "when the timestamps are connected."
+)
+phy_export_group.add_argument("static_phy_export", nargs="?", default=None, help=phy_export_help)
+phy_export_group.add_argument("--phy-export", default="subsampled", help=phy_export_help)
+
 n_jobs_group = parser.add_mutually_exclusive_group()
 n_jobs_help = (
     "Number of jobs to use for parallel processing. Default is -1 (all available cores). "
@@ -95,6 +107,10 @@ def load_extension_data_in_memory(analyzer) -> None:
 SUBSET = "_phy_spikes_subset"
 # Selected spikes whose frames are checked against the sorting
 SUBSET_CHECK_SPIKES = 10_000
+
+# --phy-export values, and the subfolders of phy_<recording> written with "both"
+PHY_EXPORT_MODES = {"subsampled": "subsampled", "subsampling": "subsampled", "full": "full", "both": "both"}
+BOTH_SUBFOLDERS = {"full": "phy-full", "subsampled": "phy-subsampled"}
 
 
 def find_sampled_waveforms(recording_name: str, analyzer) -> Path | None:
@@ -412,9 +428,92 @@ def convert_export_to_clock(
     }
 
 
+def export_phy_folder(
+    analyzer,
+    output_folder: Path,
+    sampled_waveforms: Path | None,
+    timestamps_file: Path | None,
+    curation_file: Path,
+    copy_binary: bool,
+    additional_properties: list[str],
+    dtype,
+) -> str:
+    """One Phy folder: export_to_phy, the sampled waveforms if given, clock time, curation.json.
+
+    Without sampled_waveforms, the waveforms are the analyzer's random_spikes, as
+    export_to_phy writes them. Returns the export notes.
+    """
+    notes = ""
+    sexp.export_to_phy(
+        analyzer,
+        output_folder=output_folder,
+        compute_pc_features=False,
+        add_waveforms=sampled_waveforms is None,
+        copy_binary=copy_binary,
+        additional_properties=additional_properties,
+        dtype=dtype,
+        verbose=False,
+    )
+    if sampled_waveforms is not None:
+        for subset_file in sorted(sampled_waveforms.glob(f"{SUBSET}.*")):
+            shutil.copy(subset_file, output_folder / subset_file.name)
+        notes += f"\n- Waveforms from {sampled_waveforms.name}.\n"
+    else:
+        notes += "\n- Waveforms from the analyzer's random_spikes.\n"
+
+    # Spike times in clock time, if the timestamp alignment capsule ran;
+    # otherwise they stay in frames, as before
+    if timestamps_file is None:
+        logging.info("\tNo timestamps file: spike_times stay in frames")
+    else:
+        timestamps = json.loads(timestamps_file.read_text())
+        skipped, summary = convert_export_to_clock(
+            output_folder, timestamps, analyzer.get_num_samples()
+        )
+        # Kept with the Phy output either way (frame to clock-time mapping, gaps)
+        shutil.copy(timestamps_file, output_folder / "timestamps.json")
+        if skipped is None:
+            note = (
+                f"spike times, waveform windows and sample indices converted to "
+                f"clock time from {timestamps_file.name} ({len(timestamps['gaps'])} "
+                f"gap(s), {timestamps['total_gap_s'] / 3600:.2f} h); num_samples "
+                f"{summary['num_ticks']:,} clock ticks, {summary['num_valid_intervals']} "
+                f"valid interval(s) ({summary['num_invalid_intervals']} gap/filler "
+                f"interval(s), {summary['invalid_s']:,.0f} s, excluded)"
+            )
+            logging.info(f"\t{note}")
+            notes += f"\n- {note}.\n"
+            if summary["short_valid_excluded"]:
+                note = (
+                    f"{summary['short_valid_excluded']} valid interval(s) shorter than "
+                    f"{MIN_VALID_INTERVAL_S:g} s between gaps/filler excluded "
+                    f"({summary['short_valid_excluded_s']:.3f} s in total)"
+                )
+                logging.warning(f"\t{note}")
+                notes += f"\n- {note}.\n"
+            if summary["removed_spikes"]:
+                note = (
+                    f"{summary['removed_spikes']:,} spike(s) inside gap/filler intervals "
+                    f"removed (removed_spikes_outside_valid_intervals.csv), with "
+                    f"{summary['removed_waveforms']:,} stored waveform(s)"
+                )
+                logging.info(f"\t{note}")
+                notes += f"\n- {note}.\n"
+        else:
+            logging.warning(
+                f"\tNot converting spike_times with {timestamps_file.name}: {skipped}. "
+                "timestamps.json is in the Phy folder, but spike_times stay in frames"
+            )
+
+    # Copy curation.json to output folder
+    if curation_file.is_file():
+        logging.info("\tSaving curation.json to output folder")
+        shutil.copy(curation_file, output_folder / "curation.json")
+    return notes
+
+
 if __name__ == "__main__":
     ####### Export to phy ########
-    export_notes = ""
     t_export_start_all = time.perf_counter()
 
     args = parser.parse_args()
@@ -427,6 +526,10 @@ if __name__ == "__main__":
     N_JOBS = args.static_n_jobs or args.n_jobs
     N_JOBS = int(N_JOBS) if not N_JOBS.startswith("0.") else float(N_JOBS)
     PARAMS = args.params
+    phy_export = (args.static_phy_export or args.phy_export or "subsampled").strip().lower()
+    if phy_export not in PHY_EXPORT_MODES:
+        raise ValueError(f"--phy-export must be full, subsampled or both, got {phy_export!r}")
+    PHY_EXPORT = PHY_EXPORT_MODES[phy_export]
 
     # Use CO_CPUS/N_JOBS_EXT env variable if available
     N_JOBS_EXT = os.getenv("CO_CPUS") or os.getenv("N_JOBS_EXT")
@@ -450,6 +553,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
     logging.info("Running export to Phy")
     logging.info(f"\tSAVE_BINARY: {SAVE_BINARY}")
+    logging.info(f"\tPHY_EXPORT: {PHY_EXPORT}")
 
     if len(ecephys_sorted_folders) > 0:
         # capsule mode
@@ -574,79 +678,47 @@ if __name__ == "__main__":
 
         # Waveforms sampled from shared temporal windows (waveform sampling
         # capsule) if present; otherwise the analyzer's random_spikes, as before
-        sampled_waveforms = find_sampled_waveforms(recording_name, analyzer)
-        if sampled_waveforms is not None:
-            logging.info(f"\tUsing sampled waveforms from {sampled_waveforms.name}")
+        sampled_waveforms = None
+        if PHY_EXPORT != "full":
+            sampled_waveforms = find_sampled_waveforms(recording_name, analyzer)
+        # (kind, waveform sampling folder or None for random_spikes, output folder)
+        if PHY_EXPORT == "both" and sampled_waveforms is None:
+            logging.warning(
+                "\tNo usable waveform sampling output: writing phy-full only "
+                "(phy-subsampled would be the same)"
+            )
+            exports = [("full", None, export_output_folder / BOTH_SUBFOLDERS["full"])]
+        elif PHY_EXPORT == "both":
+            exports = [
+                (kind, waveforms, export_output_folder / BOTH_SUBFOLDERS[kind])
+                for kind, waveforms in (("full", None), ("subsampled", sampled_waveforms))
+            ]
         else:
-            logging.info("\tUsing the analyzer's random_spikes waveforms")
+            exports = [(PHY_EXPORT, sampled_waveforms, export_output_folder)]
 
-        sexp.export_to_phy(
-            analyzer,
-            output_folder=export_output_folder,
-            compute_pc_features=False,
-            add_waveforms=sampled_waveforms is None,
-            copy_binary=SAVE_BINARY,
-            additional_properties=additional_properties,
-            dtype=dtype,
-            verbose=False,
-        )
-        if sampled_waveforms is not None:
-            for subset_file in sorted(sampled_waveforms.glob(f"{SUBSET}.*")):
-                shutil.copy(subset_file, export_output_folder / subset_file.name)
-            export_notes += f"\n- Waveforms from {sampled_waveforms.name}.\n"
-
-        # Spike times in clock time, if the timestamp alignment capsule ran;
-        # otherwise they stay in frames, as before
         timestamps_file = next(
             data_folder.rglob(f"timestamps_{recording_name}.json"), None
         )
-        if timestamps_file is None:
-            logging.info("\tNo timestamps file: spike_times stay in frames")
-        else:
-            timestamps = json.loads(timestamps_file.read_text())
-            skipped, summary = convert_export_to_clock(
-                export_output_folder, timestamps, analyzer.get_num_samples()
-            )
-            # Kept with the Phy output either way (frame to clock-time mapping, gaps)
-            shutil.copy(timestamps_file, export_output_folder / "timestamps.json")
-            if skipped is None:
-                note = (
-                    f"spike times, waveform windows and sample indices converted to "
-                    f"clock time from {timestamps_file.name} ({len(timestamps['gaps'])} "
-                    f"gap(s), {timestamps['total_gap_s'] / 3600:.2f} h); num_samples "
-                    f"{summary['num_ticks']:,} clock ticks, {summary['num_valid_intervals']} "
-                    f"valid interval(s) ({summary['num_invalid_intervals']} gap/filler "
-                    f"interval(s), {summary['invalid_s']:,.0f} s, excluded)"
-                )
-                logging.info(f"\t{note}")
-                export_notes += f"\n- {note}.\n"
-                if summary["short_valid_excluded"]:
-                    note = (
-                        f"{summary['short_valid_excluded']} valid interval(s) shorter than "
-                        f"{MIN_VALID_INTERVAL_S:g} s between gaps/filler excluded "
-                        f"({summary['short_valid_excluded_s']:.3f} s in total)"
-                    )
-                    logging.warning(f"\t{note}")
-                    export_notes += f"\n- {note}.\n"
-                if summary["removed_spikes"]:
-                    note = (
-                        f"{summary['removed_spikes']:,} spike(s) inside gap/filler intervals "
-                        f"removed (removed_spikes_outside_valid_intervals.csv), with "
-                        f"{summary['removed_waveforms']:,} stored waveform(s)"
-                    )
-                    logging.info(f"\t{note}")
-                    export_notes += f"\n- {note}.\n"
-            else:
-                logging.warning(
-                    f"\tNot converting spike_times with {timestamps_file.name}: {skipped}. "
-                    "timestamps.json is in the Phy folder, but spike_times stay in frames"
-                )
-
-        # Copy curation.json to output folder
         curation_file = curated_base_folder / f"curation_{recording_name}.json"
-        if curation_file.is_file():
-            logging.info("\tSaving curation.json to output folder")
-            shutil.copy(curation_file, export_output_folder / "curation.json")
+        export_notes = ""
+        for kind, waveforms, output_folder in exports:
+            if waveforms is not None:
+                logging.info(f"\t{output_folder.name}: sampled waveforms from {waveforms.name}")
+            else:
+                logging.info(f"\t{output_folder.name}: the analyzer's random_spikes waveforms")
+            notes = export_phy_folder(
+                analyzer,
+                output_folder,
+                waveforms,
+                timestamps_file,
+                curation_file,
+                SAVE_BINARY,
+                additional_properties,
+                dtype,
+            )
+            if PHY_EXPORT == "both":
+                notes = f"\n{output_folder.name}:\n{notes}"
+            export_notes += notes
 
         t_export_end = time.perf_counter()
         elapsed_time_export = np.round(t_export_end - t_export_start, 2)
@@ -665,7 +737,7 @@ if __name__ == "__main__":
             end_date_time=datetime_start_export
             + timedelta(seconds=np.floor(elapsed_time_export)),
             output_path=str(results_folder),
-            output_parameters={},
+            output_parameters={"phy_export": PHY_EXPORT},
             notes=export_notes,
         )
         with open(export_output_process_json, "w") as f:
