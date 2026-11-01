@@ -59,6 +59,9 @@ parser.add_argument(
 
 # Spike times converted per block, to keep memory bounded for billions of spikes
 SPIKE_TIME_BLOCK = 100_000_000
+# Valid intervals shorter than this, between gaps/filler, are excluded too: a few
+# spikes in a sub-ms interval would show as huge firing rates in Phy
+MIN_VALID_INTERVAL_S = 1.0
 
 # Extensions export_to_phy reads (PCs are not exported)
 PHY_EXTENSIONS = (
@@ -205,7 +208,8 @@ def convert_export_to_clock(
     sample_index and window_bounds, with num_samples in clock ticks.
 
     The gaps (no samples) and filler regions (padding samples, zero traces) are
-    left out of valid_intervals, written to params.py and the subset manifest.
+    left out of valid_intervals, written to params.py and the subset manifest,
+    and so are valid intervals shorter than MIN_VALID_INTERVAL_S between them.
     The few spikes that fall inside them are removed from every per-spike file
     and listed in removed_spikes_outside_valid_intervals.csv; stored waveforms
     follow their spikes.
@@ -264,13 +268,26 @@ def convert_export_to_clock(
         frame = gap["pipeline_frame"]
         invalid.append((int(to_ticks(frame - 1)) + 1, int(to_ticks(frame))))
     invalid = _merge_intervals([(max(0, a), min(num_ticks, b)) for a, b in invalid])
-    valid, position = [], 0
-    for start, end in invalid:
-        if start > position:
-            valid.append((position, start))
-        position = end
-    if position < num_ticks:
-        valid.append((position, num_ticks))
+
+    def complement(intervals):
+        valid, position = [], 0
+        for start, end in intervals:
+            if start > position:
+                valid.append((position, start))
+            position = end
+        if position < num_ticks:
+            valid.append((position, num_ticks))
+        return valid
+
+    valid = complement(invalid)
+    # No tiny isolated valid intervals: they join the gap/filler around them
+    short_valid = []
+    if invalid:
+        min_valid_ticks = int(round(MIN_VALID_INTERVAL_S * fs))
+        short_valid = [(a, b) for a, b in valid if b - a < min_valid_ticks]
+        if short_valid:
+            invalid = _merge_intervals(invalid + short_valid)
+            valid = complement(invalid)
 
     # ── Spikes outside the valid intervals ──────────────────────────────────
     spike_times = np.load(phy_folder / "spike_times.npy", mmap_mode="r")[:, 0]
@@ -387,6 +404,8 @@ def convert_export_to_clock(
         "num_valid_intervals": len(valid),
         "num_invalid_intervals": len(invalid),
         "invalid_s": sum(b - a for a, b in invalid) / fs,
+        "short_valid_excluded": len(short_valid),
+        "short_valid_excluded_s": sum(b - a for a, b in short_valid) / fs,
         "removed_spikes": int(removed.size),
         "removed_waveforms": removed_waveforms,
         "bridging_windows": len(bridging_windows) if subset_spikes_file.is_file() else 0,
@@ -601,6 +620,14 @@ if __name__ == "__main__":
                 )
                 logging.info(f"\t{note}")
                 export_notes += f"\n- {note}.\n"
+                if summary["short_valid_excluded"]:
+                    note = (
+                        f"{summary['short_valid_excluded']} valid interval(s) shorter than "
+                        f"{MIN_VALID_INTERVAL_S:g} s between gaps/filler excluded "
+                        f"({summary['short_valid_excluded_s']:.3f} s in total)"
+                    )
+                    logging.warning(f"\t{note}")
+                    export_notes += f"\n- {note}.\n"
                 if summary["removed_spikes"]:
                     note = (
                         f"{summary['removed_spikes']:,} spike(s) inside gap/filler intervals "
