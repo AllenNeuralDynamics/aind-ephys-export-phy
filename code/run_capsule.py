@@ -20,6 +20,8 @@ import pandas as pd
 # SPIKEINTERFACE
 import spikeinterface as si
 import spikeinterface.exporters as sexp
+from spikeinterface.core import ChannelSparsity, NumpySorting
+from spikeinterface.core.base import minimum_spike_dtype
 from aind_data_schema.components.identifiers import Code
 
 # AIND
@@ -85,6 +87,10 @@ PHY_EXTENSIONS = (
     "quality_metrics",
     "template_metrics",
 )
+# Per-spike extensions stay lazy: amplitudes.npy is written from them in blocks
+# (4 B per spike, ~31 GB for 7.7 billion spikes, if read whole)
+LAZY_EXTENSIONS = ("spike_amplitudes",)
+SPIKE_DTYPE = np.dtype(minimum_spike_dtype)
 
 
 def load_extension_data_in_memory(analyzer) -> None:
@@ -92,11 +98,13 @@ def load_extension_data_in_memory(analyzer) -> None:
 
     A lazily loaded analyzer keeps extension data in zarr arrays, which
     export_to_phy indexes like numpy (e.g. amplitudes[:, np.newaxis]) and fails
-    on. The spike vector itself stays lazy.
+    on. The spike vector and the per-spike extensions stay lazy (only accessed
+    in blocks, by export_to_phy_streamed). Every extension is loaded here, before
+    export_to_phy_streamed swaps in its stand-in sorting.
     """
     for name in PHY_EXTENSIONS:
         extension = analyzer.get_extension(name)
-        if extension is None:
+        if extension is None or name in LAZY_EXTENSIONS:
             continue
         for key, value in extension.data.items():
             # zarr (or other array-like) data; DataFrames and numpy arrays stay
@@ -164,6 +172,158 @@ def find_sampled_waveforms(recording_name: str, analyzer) -> Path | None:
         logging.warning(f"\tNot using {folder.name}: {'; '.join(reasons)}")
         return None
     return folder
+
+
+def _take_rows(array, rows: np.ndarray) -> np.ndarray:
+    """array[rows] for a zarr array (orthogonal selection, reads only those chunks) or numpy."""
+    if hasattr(array, "oindex"):
+        return np.asarray(array.oindex[rows])
+    return np.asarray(array[rows])
+
+
+def _write_random_spikes_subset(analyzer, output_folder: Path, unit_index, unit_ids) -> None:
+    """The _phy_spikes_subset files of export_to_phy(add_waveforms=True), from the
+    random_spikes rows only.
+
+    export_to_phy gets the selected spikes' units with get_random_spikes(), which
+    indexes the spike vector with an array: a lazy one is read whole for that.
+    Same files and layout otherwise: spikes, channels (-1 padded) and waveforms,
+    in spike-vector order, for the non-empty units `unit_ids`.
+    """
+    random_spikes_ext = analyzer.get_extension("random_spikes")
+    waveforms_ext = analyzer.get_extension("waveforms")
+    if random_spikes_ext is None or waveforms_ext is None:
+        logging.warning(
+            "\tCannot save the phy spikes-waveforms subset: the 'waveforms' or "
+            "'random_spikes' extension is not computed."
+        )
+        return
+    sorting = analyzer.sorting
+    sparsity = analyzer.sparsity if analyzer.is_sparse() else ChannelSparsity.create_dense(analyzer)
+    sparse_dict = sparsity.unit_id_to_channel_indices
+
+    subset_spike_indices = np.asarray(random_spikes_ext.get_data()).astype(np.int64)
+    subset_waveforms = np.asarray(waveforms_ext.get_data())
+    # order by absolute spike index, matching the row order of spike_times.npy
+    order = np.argsort(subset_spike_indices, kind="stable")
+    subset_spike_indices = subset_spike_indices[order]
+    subset_waveforms = subset_waveforms[order]
+    subset_unit_index = _take_rows(unit_index, subset_spike_indices)
+
+    max_num_channels_wf = max(len(chan_inds) for chan_inds in sparse_dict.values())
+    num_subset_spikes, num_samples_wf = subset_waveforms.shape[:2]
+    # phy expects -1 for "no channel" padding
+    spike_channels = -np.ones((num_subset_spikes, max_num_channels_wf), dtype="int32")
+    spike_waveforms = np.zeros(
+        (num_subset_spikes, num_samples_wf, max_num_channels_wf), dtype=subset_waveforms.dtype
+    )
+    # A sparse waveforms extension already stores only (and in order) the
+    # analyzer's sparse channels; a dense one needs them selected
+    waveforms_ext_is_sparse = waveforms_ext.sparsity is not None
+    for unit_id in unit_ids:
+        spike_mask = subset_unit_index == sorting.id_to_index(unit_id)
+        if not np.any(spike_mask):
+            continue
+        chan_inds = sparse_dict[unit_id]
+        spike_channels[spike_mask, : len(chan_inds)] = chan_inds
+        unit_waveforms = subset_waveforms[spike_mask]
+        spike_waveforms[spike_mask, :, : len(chan_inds)] = (
+            unit_waveforms[:, :, : len(chan_inds)]
+            if waveforms_ext_is_sparse
+            else unit_waveforms[:, :, chan_inds]
+        )
+    np.save(output_folder / f"{SUBSET}.spikes.npy", subset_spike_indices)
+    np.save(output_folder / f"{SUBSET}.channels.npy", spike_channels)
+    np.save(output_folder / f"{SUBSET}.waveforms.npy", spike_waveforms)
+
+
+def export_to_phy_streamed(analyzer, output_folder: Path, add_waveforms: bool, **export_kwargs) -> None:
+    """export_to_phy, with the per-spike files written one block at a time.
+
+    For billions of spikes, export_to_phy runs out of memory: it materializes the
+    whole spike vector (to_spike_vector(concatenated=False) slices a lazy one into
+    memory, 24 B per spike), calls get_unit_spike_train for every unit (which
+    caches a reordered copy of the spike vector) and reads all the amplitudes:
+    ~250 GB for 7.7 billion spikes.
+
+    Instead, export_to_phy runs on a stand-in sorting with the same units and one
+    spike per non-empty unit. It writes every per-unit file as before (params.py,
+    templates, similarity, channel maps, metrics and cluster tsvs, the binary).
+    spike_times, spike_templates, spike_clusters and amplitudes are then replaced
+    by the full ones, read from the lazy spike vector and amplitudes in blocks,
+    with the same dtypes and values as export_to_phy writes, and the random_spikes
+    waveform subset (add_waveforms) is written from the selected rows only.
+    """
+    sorting = analyzer.sorting
+    assert sorting.get_num_segments() == 1, "Export to phy only works with one segment"
+    spikes = sorting.to_spike_vector()  # lazy for a lazily loaded zarr analyzer
+    num_spikes = len(spikes)
+    sample_index, unit_index = spikes["sample_index"], spikes["unit_index"]
+    unit_ids = sorting.unit_ids
+
+    # Spikes per unit: export_to_phy leaves out the empty units
+    counts = np.zeros(len(unit_ids), dtype=np.int64)
+    for i0 in range(0, num_spikes, SPIKE_TIME_BLOCK):
+        counts += np.bincount(
+            np.asarray(unit_index[i0 : i0 + SPIKE_TIME_BLOCK]), minlength=len(unit_ids)
+        )
+
+    amplitudes_ext = analyzer.get_extension("spike_amplitudes")
+    if amplitudes_ext is None:
+        # As export_to_phy does (needs the recording)
+        analyzer.compute("spike_amplitudes")
+        amplitudes_ext = analyzer.get_extension("spike_amplitudes")
+    amplitudes = amplitudes_ext.data["amplitudes"]
+    if len(amplitudes) != num_spikes:
+        raise RuntimeError(f"{len(amplitudes):,} spike amplitudes for {num_spikes:,} spikes")
+
+    stand_in_spikes = np.zeros(np.count_nonzero(counts), dtype=SPIKE_DTYPE)
+    stand_in_spikes["unit_index"] = np.flatnonzero(counts)
+    stand_in = NumpySorting(stand_in_spikes, sorting.sampling_frequency, unit_ids)
+    # Unit properties (group, curation labels) go into the cluster tsvs
+    for key in sorting.get_property_keys():
+        stand_in.set_property(key, sorting.get_property(key))
+    analyzer.sorting = stand_in
+    try:
+        sexp.export_to_phy(
+            analyzer,
+            output_folder=output_folder,
+            compute_pc_features=False,
+            compute_amplitudes=False,
+            add_waveforms=False,
+            **export_kwargs,
+        )
+    finally:
+        analyzer.sorting = sorting
+
+    # Per-spike files, as export_to_phy writes them: (num_spikes, 1), spike-vector order
+    sources = {
+        "spike_times.npy": (sample_index, SPIKE_DTYPE["sample_index"]),
+        "spike_templates.npy": (unit_index, SPIKE_DTYPE["unit_index"]),
+        "spike_clusters.npy": (unit_index, SPIKE_DTYPE["unit_index"]),
+        "amplitudes.npy": (amplitudes, np.dtype(amplitudes.dtype)),
+    }
+    targets = {
+        name: np.lib.format.open_memmap(
+            output_folder / name, mode="w+", dtype=dtype, shape=(num_spikes, 1)
+        )
+        for name, (_, dtype) in sources.items()
+    }
+    for i0 in range(0, num_spikes, SPIKE_TIME_BLOCK):
+        i1 = min(i0 + SPIKE_TIME_BLOCK, num_spikes)
+        units = np.asarray(unit_index[i0:i1])
+        targets["spike_times.npy"][i0:i1, 0] = np.asarray(sample_index[i0:i1])
+        targets["spike_templates.npy"][i0:i1, 0] = units
+        targets["spike_clusters.npy"][i0:i1, 0] = units
+        targets["amplitudes.npy"][i0:i1, 0] = np.asarray(amplitudes[i0:i1])
+        del units
+    for target in targets.values():
+        target.flush()
+    del targets
+    logging.info(f"\tWrote the per-spike files ({num_spikes:,} spikes) in blocks")
+
+    if add_waveforms:
+        _write_random_spikes_subset(analyzer, output_folder, unit_index, unit_ids[counts > 0])
 
 
 # Phy files with one row per spike (pc_features only if PCs were exported)
@@ -444,10 +604,9 @@ def export_phy_folder(
     export_to_phy writes them. Returns the export notes.
     """
     notes = ""
-    sexp.export_to_phy(
+    export_to_phy_streamed(
         analyzer,
-        output_folder=output_folder,
-        compute_pc_features=False,
+        output_folder,
         add_waveforms=sampled_waveforms is None,
         copy_binary=copy_binary,
         additional_properties=additional_properties,
